@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
 	"time"
@@ -10,7 +11,7 @@ import (
 
 func main() {
 	// Cambiar la URL para conectar con la IP del servidor
-	url := "ws://192.168.0.37:8080/ws"
+	url := "ws://192.168.137.40:8080/ws"
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
 		log.Fatal("Error al conectar:", err)
@@ -44,6 +45,8 @@ func main() {
 			log.Println("Error al enviar datos:", err)
 			return
 		}
+
+		fmt.Println(data)
 
 		// Esperar la respuesta del servidor
 		_, message, err := conn.ReadMessage()
