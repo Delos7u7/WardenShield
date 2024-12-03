@@ -3,187 +3,185 @@ package main
 import (
 	"database/sql"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
-	"time"
+	"strings"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/gorilla/websocket"
 )
 
 type Data struct {
-	Hora        string  `json:"hora"`
-	Distancia   float64 `json:"distancia"`
 	Temperatura float64 `json:"temperatura"`
+	Distancia   float64 `json:"distancia"`
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
+var (
+	csvPath         = `C:\Users\Intel\Desktop\SEMESTRE7\Inteligencia Artificial\U1\InteligenciaArtificalGrafica\InteligenciaArtificalGrafica\bin\Debug\datos.csv`
+	activationCount = make(map[int]int)
+)
 
-// Cambiar la extensión del archivo a .csv
-const csvPath = `C:\Users\Jose Ramon\Desktop\Escuela\SEMESTRE7\InteligenciaArtificial\InteligenciaAritificalGrafica\bin\Debug\datos.csv`
-
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Error al establecer WebSocket:", err)
-		http.Error(w, "No se pudo establecer conexión WebSocket", http.StatusBadRequest)
+// Manejador de la ruta de recepción de datos
+func handleDataReceive(w http.ResponseWriter, r *http.Request) {
+	// Verificar que sea una solicitud POST
+	if r.Method != http.MethodPost {
+		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
 		return
 	}
-	defer conn.Close()
 
-	for {
-		var data Data
-		err := conn.ReadJSON(&data)
-		if err != nil {
-			log.Println("Error al leer datos de WebSocket:", err)
-			break
-		}
-
-		// Si no se proporciona hora, se asigna la hora actual
-		if data.Hora == "" {
-			data.Hora = time.Now().Format("15:04:05")
-		}
-
-		// Guardar los datos en la base de datos y en el CSV
-		if err := saveToDatabase(data); err != nil {
-			log.Println("Error al guardar en la base de datos:", err)
-			continue
-		}
-		if err := saveToCSV(data); err != nil {
-			log.Println("Error al guardar en CSV:", err)
-			continue
-		}
-
-		// Responder al cliente WebSocket
-		if err := conn.WriteMessage(websocket.TextMessage, []byte("Datos recibidos correctamente")); err != nil {
-			log.Println("Error al enviar respuesta WebSocket:", err)
-			break
-		}
+	// Decodificar los datos JSON
+	var data Data
+	err := json.NewDecoder(r.Body).Decode(&data)
+	if err != nil {
+		http.Error(w, "Error al decodificar datos", http.StatusBadRequest)
+		log.Println("Error al decodificar datos:", err)
+		return
 	}
+
+	// Guardar los datos en la base de datos
+	insertedID, err := saveToDatabase(data)
+	if err != nil {
+		http.Error(w, "Error al guardar en la base de datos", http.StatusInternalServerError)
+		log.Println("Error al guardar en la base de datos:", err)
+		return
+	}
+
+	// Obtener la hora asociada a la medición
+	hora, err := getHoraFromDatabase(insertedID)
+	if err != nil {
+		http.Error(w, "Error al obtener la hora", http.StatusInternalServerError)
+		log.Println("Error al obtener la hora:", err)
+		return
+	}
+
+	// Actualizar contador de activaciones por hora
+	horaInt := extractHour(hora)
+	activationCount[horaInt]++
+
+	// Guardar las activaciones en el archivo CSV
+	if err := saveActivationsToCSV(); err != nil {
+		http.Error(w, "Error al guardar activaciones", http.StatusInternalServerError)
+		log.Println("Error al guardar activaciones:", err)
+		return
+	}
+
+	// Responder al cliente
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Datos recibidos y activaciones actualizadas",
+	})
 }
 
-func saveToDatabase(data Data) error {
-	dsn := "root:123456@tcp(127.0.0.1:3306)/integrador7"
+// Guardar datos en la base de datos
+func saveToDatabase(data Data) (int64, error) {
+	dsn := "root:itsoeh23@tcp(0.0.0.0:3306)/integrador7"
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer db.Close()
 
-	_, err = db.Exec("INSERT INTO mediciones (hora, distancia, temperatura) VALUES (?, ?, ?)",
-		data.Hora, data.Distancia, data.Temperatura)
-	return err
-}
-
-func calculateProbability(hora string, distancia float64) float64 {
-	decimalHour, err := horaADecimal(hora)
+	result, err := db.Exec("INSERT INTO mediciones (hora, distancia, temperatura) VALUES (NOW(), ?, ?)",
+		data.Distancia, data.Temperatura)
 	if err != nil {
-		log.Println("Error al convertir hora a decimal:", err)
-		return 0.0
+		return 0, err
 	}
 
-	var baseProbability float64
-
-	switch {
-	case decimalHour >= 8 && decimalHour <= 10:
-		baseProbability = 0.8
-	case decimalHour >= 16 && decimalHour <= 18:
-		baseProbability = 0.7
-	case decimalHour >= 12 && decimalHour <= 14:
-		baseProbability = 0.6
-	default:
-		baseProbability = 0.3
-	}
-
-	distanceAdjustment := 1.0 - (distancia / 10.0)
-	if distanceAdjustment < 0 {
-		distanceAdjustment = 0
-	}
-
-	probability := baseProbability * distanceAdjustment
-	if probability > 1.0 {
-		probability = 1.0
-	}
-
-	return probability
+	return result.LastInsertId()
 }
 
-func horaADecimal(hora string) (float64, error) {
-	t, err := time.Parse("15:04:05", hora)
+// Obtener la hora de la base de datos
+func getHoraFromDatabase(id int64) (string, error) {
+	dsn := "root:itsoeh23@tcp(0.0.0.0:3306)/integrador7"
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return 0.0, err
+		return "", err
+	}
+	defer db.Close()
+
+	var hora string
+	err = db.QueryRow("SELECT hora FROM mediciones WHERE id = ?", id).Scan(&hora)
+	if err != nil {
+		return "", err
 	}
 
-	// Convertir la hora, minuto y segundo a un valor decimal
-	h := float64(t.Hour())
-	m := float64(t.Minute()) / 60.0
-	s := float64(t.Second()) / 3600.0
-
-	return h + m + s, nil
+	return hora, nil
 }
 
-func saveToCSV(data Data) error {
+// Extraer la hora en formato entero (1-24)
+func extractHour(hora string) int {
+	components := strings.Split(hora, ":")
+	hour, _ := strconv.Atoi(components[0]) // Tomar solo la parte de la hora
+	return hour
+}
+
+// Guardar activaciones por hora en un archivo CSV
+func saveActivationsToCSV() error {
 	// Asegurarse de que el directorio existe
 	dir := filepath.Dir(csvPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("error creando directorio: %v", err)
 	}
 
-	// Verificar si el archivo existe
-	var file *os.File
-	if _, err := os.Stat(csvPath); os.IsNotExist(err) {
-		// Crear el archivo si no existe
-		file, err = os.Create(csvPath)
-		if err != nil {
-			return fmt.Errorf("error creando archivo CSV: %v", err)
-		}
-	} else {
-		// Abrir el archivo en modo append si ya existe
-		file, err = os.OpenFile(csvPath, os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("error abriendo archivo CSV: %v", err)
-		}
+	// Abre el archivo CSV en modo de apéndice (agregar nuevas líneas)
+	file, err := os.OpenFile(csvPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("error abriendo archivo CSV: %v", err)
 	}
 	defer file.Close()
 
-	// Crear el writer CSV
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// Convertir la hora a formato decimal
-	decimalHora, err := horaADecimal(data.Hora)
+	// Si el archivo está vacío, escribir el encabezado
+	fileInfo, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("error convirtiendo hora a decimal: %v", err)
+		return fmt.Errorf("error obteniendo información del archivo: %v", err)
+	}
+	if fileInfo.Size() == 0 {
+		if err := writer.Write([]string{"Hora", "Activaciones", "Probabilidad (%)"}); err != nil {
+			return fmt.Errorf("error escribiendo encabezado CSV: %v", err)
+		}
 	}
 
-	// Calcular la probabilidad
-	probability := calculateProbability(data.Hora, data.Distancia)
-
-	// Preparar el registro CSV con la hora convertida a decimal
-	record := []string{
-		strconv.FormatFloat(decimalHora, 'f', 6, 64), // Escribir la hora en formato decimal
-		strconv.FormatFloat(data.Distancia, 'f', 2, 64),
-		strconv.FormatFloat(probability, 'f', 2, 64),
-	}
-
-	// Escribir el registro
-	if err := writer.Write(record); err != nil {
-		return fmt.Errorf("error escribiendo en CSV: %v", err)
+	// Escribir datos de activaciones
+	for hora, activaciones := range activationCount {
+		probability := float64(activaciones) // Ajuste de probabilidad si es necesario
+		record := []string{
+			strconv.Itoa(hora),
+			strconv.Itoa(activaciones),
+			fmt.Sprintf("%.2f", probability),
+		}
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("error escribiendo fila CSV: %v", err)
+		}
 	}
 
 	return nil
 }
 
 func main() {
-	http.HandleFunc("/ws", handleWebSocket)
-	fmt.Println("Servidor WebSocket escuchando en el puerto 8080...")
-	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
+	// Configurar el manejador para la ruta de recepción de datos
+	http.HandleFunc("/datos", handleDataReceive)
+
+	// Configurar un manejador CORS básico
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Permitir solicitudes desde cualquier origen
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		// Manejar solicitudes OPTIONS para CORS
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	})
+
+	fmt.Println("Servidor escuchando en 0.0.0.0:8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
